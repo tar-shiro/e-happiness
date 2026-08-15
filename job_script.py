@@ -117,18 +117,36 @@ def _to_dict(obj):
         return obj
     if hasattr(obj, "_data"):
         return obj._data
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if hasattr(obj, "dict"):
+        return obj.dict()
     return obj
 
 
-def _auth_user_profile(api):
-    """Extract the authenticated user dict right after api.auth() (best-effort)."""
+def _auth_user_profile(api, auth_resp=None):
+    """Extract the authenticated user dict. pixivpy3's auth() does NOT store the
+    profile on the api object (it sets self.user_id and returns the token
+    response whose .response.user holds it), so reading `api.user` alone always
+    comes back empty. Prefer the auth response, then api.user, then a
+    user_detail fetch as fallbacks (best-effort)."""
     try:
+        if auth_resp is not None:
+            resp_user = getattr(getattr(auth_resp, "response", None), "user", None)
+            if resp_user is not None:
+                return _to_dict(resp_user)
         raw = getattr(api, "user", None)
-        if raw is None:
-            return None
-        return _to_dict(raw)
+        if raw is not None:
+            return _to_dict(raw)
+        uid = getattr(api, "user_id", None)
+        if uid:
+            detail = _pixiv_api_call(api.user_detail, uid)
+            detail_user = getattr(detail, "user", None)
+            if detail_user is not None:
+                return _to_dict(detail_user)
     except Exception:
-        return None
+        pass
+    return None
 
 
 def _extract_items(resp):
@@ -283,7 +301,7 @@ def main():
 
         # 3. Auth + run with pagination
         api = AppPixivAPI()
-        _pixiv_api_call(api.auth, refresh_token=refresh_token)
+        auth_resp = _pixiv_api_call(api.auth, refresh_token=refresh_token)
         print("  pixiv auth ok")
 
         # 3b. Backfill the owning gallery user's public profile — the worker can't
@@ -291,7 +309,7 @@ def main():
         # is confirmed. A bad/expired token raises in api.auth() above and the job
         # errors with Pixiv's own message, surfaced in the poll UI.
         gallery_user_id = params.get("gallery_user_id")
-        user_profile = _auth_user_profile(api)
+        user_profile = _auth_user_profile(api, auth_resp)
         if gallery_user_id and user_profile:
             try:
                 avatar = (user_profile.get("profile_image_urls") or {}).get("px_50x50") or ""
