@@ -1,2 +1,2 @@
-pixivpy3>=3.9.3,<4
+pixivpy3>=3.7.5
 requests>=2.31.0
