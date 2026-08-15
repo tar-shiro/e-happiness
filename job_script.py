@@ -158,6 +158,9 @@ def _extract_items(resp):
         val = getattr(resp, attr, None)
         if val is not None:
             return [_to_dict(i) for i in val], _next_offset(getattr(resp, "next_url", None))
+    val = getattr(resp, "user_previews", None)
+    if val is not None:
+        return [_to_dict(i) for i in val], _next_offset(getattr(resp, "next_url", None))
     for attr in ("illust", "novel", "user", "ugoira_metadata"):
         val = getattr(resp, attr, None)
         if val is not None:
@@ -199,6 +202,8 @@ def _run_action(api, action, params):
         }
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
         return api.search_novel(**kwargs)
+    if action == "search_user":
+        return api.search_user(params["user_name"], offset=params.get("offset"))
     if action == "illust_ranking":
         return api.illust_ranking(mode=params["mode"], date=params.get("date"), offset=params.get("offset"))
     if action == "novel_ranking":
@@ -222,6 +227,137 @@ def _run_action(api, action, params):
     if action == "ugoira_metadata":
         return api.ugoira_metadata(params["illust_id"])
     raise RuntimeError(f"unsupported action: {action}")
+
+
+# ---- Compound search (multi-keyword / tags / exclude / match) ----
+#
+# pixiv's API only takes one `word` string, but space-separated words in that
+# string already do native AND (for partial_match_for_tags) and `-word` does
+# native exclusion. So we only do our own work when we can't express the query
+# in one call:
+#   - match=all: run word-query + tag-query, intersect by id. A single field is
+#     one native call (AND via spaces).
+#   - match=any: run one call per term (word terms use the chosen search_target,
+#     tag terms always partial_match_for_tags), union + dedupe. Capped at 5.
+#   - exclude: post-filter by title/tags/artist (case-insensitive), always.
+
+def _item_id(item):
+    return item.get("id") or item.get("illust_id") or item.get("novel_id")
+
+
+def _matches_exclude(item, exclude_terms):
+    text = " ".join([
+        item.get("title") or "",
+        item.get("name") or "",
+        " ".join((t.get("name") or "") for t in (item.get("tags") or [])),
+        (item.get("user") or {}).get("name") or "",
+    ]).lower()
+    return any(term in text for term in exclude_terms)
+
+
+def _build_queries(params):
+    """Return the list of search kwargs dicts. Each dict is one pixiv search
+    call. match=all → one query per present field (word / tags), match=any →
+    one query per individual term, capped at 5."""
+    match = params.get("match") or "all"
+    word = (params.get("word") or "").strip()
+    tags = (params.get("tags") or "").strip()
+    chosen = params.get("search_target") or "partial_match_for_tags"
+    common = {k: params[k] for k in ("sort", "start_date", "end_date") if params.get(k)}
+    if match == "all":
+        queries = []
+        if word:
+            queries.append(dict(common, word=word, search_target=chosen))
+        if tags:
+            queries.append(dict(common, word=tags, search_target="partial_match_for_tags"))
+        return queries
+    terms = []
+    for t in word.split():
+        terms.append((t, chosen))
+    for t in tags.split():
+        terms.append((t, "partial_match_for_tags"))
+    if not terms:
+        return []
+    return [dict(common, word=t, search_target=st) for t, st in terms[:5]]
+
+
+def _run_compound_search(api, action, params, pages, budget_limit):
+    """Run the query set from _build_queries, intersect (all) or union (any),
+    then apply exclude filtering. Returns the combined item list."""
+    method = getattr(api, action)
+    match = params.get("match") or "all"
+    exclude_terms = (params.get("exclude") or "").lower().split()
+    queries = _build_queries(params)
+    groups = []
+    start = time.time()
+    for q in queries:
+        group = []
+        next_offset = None
+        page = 0
+        while page < pages:
+            if time.time() - start > budget_limit:
+                break
+            call_params = dict(q)
+            if next_offset is not None:
+                call_params["offset"] = next_offset
+            resp = _pixiv_api_call(method, **call_params)
+            items, next_offset = _extract_items(resp)
+            group.extend(items)
+            page += 1
+            if not items or next_offset is None:
+                break
+            time.sleep(0.8 + random.uniform(0, 0.7))
+        groups.append(group)
+        if time.time() - start > budget_limit:
+            break
+
+    if match == "all" and len(groups) > 1:
+        keep = {_item_id(i) for i in groups[0]}
+        for g in groups[1:]:
+            keep &= {_item_id(i) for i in g}
+        merged = [i for i in groups[0] if _item_id(i) in keep]
+    else:
+        merged = []
+        seen = set()
+        for g in groups:
+            for i in g:
+                key = _item_id(i)
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(i)
+
+    if exclude_terms:
+        merged = [i for i in merged if not _matches_exclude(i, exclude_terms)]
+    return merged
+
+
+def _normalize_user_items(items):
+    """search_user returns user_previews; reduce each to the user identity the
+    frontend needs (id + name/account/avatar). avatar is put in
+    profile_image_urls so the worker's /liveimg decorator signs it."""
+    out = []
+    for preview in items:
+        u = preview.get("user") or {}
+        av = (u.get("profile_image_urls") or {})
+        avatar = av.get("px_170x170") or av.get("px_50x50") or av.get("px_16x16") or ""
+        uid = str(u.get("id") or "")
+        if not uid:
+            continue
+        profile = {}
+        if avatar:
+            profile = {"medium": avatar, "square_medium": avatar, "px_50x50": avatar}
+        out.append({
+            "user_id": uid,
+            "id": uid,
+            "account": u.get("account") or "",
+            "name": u.get("name") or "",
+            "artist_name": "@" + (u.get("account") or ""),
+            "profile_image_urls": profile,
+            "type": "user",
+            "tags": [],
+        })
+    return out
 
 
 def _sort_results(items, sort_by, order):
@@ -331,26 +467,43 @@ def main():
             print("  whoami done")
             return
 
-        all_items = []
-        next_offset = None
-        page = 0
+        # Compound search (multi-keyword / tags / exclude / match) needs several
+        # pixiv calls combined server-side — the single-query loop can't express
+        # it. Plain single-field searches keep the offset-pagination loop.
+        is_compound = (
+            action in ("search_illust", "search_novel")
+            and bool((params.get("tags") or "").strip() or (params.get("exclude") or "").strip() or (params.get("match") or "all") != "all")
+        )
+
         warning = None
-        start = time.time()
-        while page < pages:
-            if time.time() - start > budget_limit:
-                warning = f"timeout after {page} page(s)"
-                break
-            call_params = dict(params)
-            if next_offset is not None:
-                call_params["offset"] = next_offset
-            resp = _pixiv_api_call(_run_action, api, action, call_params)
-            items, next_offset = _extract_items(resp)
-            all_items.extend(items)
-            page += 1
-            print(f"  page {page}: +{len(items)} (total {len(all_items)})")
-            if not items or next_offset is None:
-                break
-            time.sleep(0.8 + random.uniform(0, 0.7))
+        if is_compound:
+            all_items = _run_compound_search(api, action, params, pages, budget_limit)
+            page = pages
+            print(f"  compound: {len(all_items)} combined results (match={params.get('match') or 'all'})")
+        else:
+            all_items = []
+            next_offset = None
+            page = 0
+            start = time.time()
+            while page < pages:
+                if time.time() - start > budget_limit:
+                    warning = f"timeout after {page} page(s)"
+                    break
+                call_params = dict(params)
+                if next_offset is not None:
+                    call_params["offset"] = next_offset
+                resp = _pixiv_api_call(_run_action, api, action, call_params)
+                items, next_offset = _extract_items(resp)
+                all_items.extend(items)
+                page += 1
+                print(f"  page {page}: +{len(items)} (total {len(all_items)})")
+                if not items or next_offset is None:
+                    break
+                time.sleep(0.8 + random.uniform(0, 0.7))
+
+        if action == "search_user":
+            all_items = _normalize_user_items(all_items)
+            print(f"  user results: {len(all_items)}")
 
         results = _sort_results(all_items, sort_by, sort_order)
         payload = {"results": results, "count": len(results), "pages": page}
