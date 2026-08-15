@@ -6,7 +6,23 @@ the job id from the dispatch payload, pulls the one-time Pixiv refresh token
 out of D1 `job_tokens` (and deletes that row immediately — 用完即焚), runs the
 requested action via pixivpy3, and writes the results back into D1
 `job_results` for the browser to poll.
+CREATE TABLE IF NOT EXISTS job_results (
+  job_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL,                -- pending | running | done | error
+  params TEXT NOT NULL,                -- JSON {action, params, pagination}
+  code_hash TEXT,                      -- 存取碼 SHA-256，job 所有權
+  payload TEXT,                        -- JSON results（done 時）
+  error TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_job_results_status ON job_results(status);
 
+CREATE TABLE IF NOT EXISTS job_tokens (
+  job_id TEXT PRIMARY KEY,
+  token TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
 Security notes:
   - The token is read from the dispatch payload's jobId, never from an env var,
     and is deleted from D1 the moment it is read. It is never printed.
@@ -26,7 +42,6 @@ from pixivpy3 import AppPixivAPI
 
 _MAX_RETRIES = 2
 _TRANSIENT_STATUS = {429, 500, 502, 503, 504}
-_TOTAL_BUDGET_SEC = 240  # hard cap for the whole page loop
 
 
 class _TransientError(Exception):
@@ -103,6 +118,17 @@ def _to_dict(obj):
     if hasattr(obj, "_data"):
         return obj._data
     return obj
+
+
+def _auth_user_profile(api):
+    """Extract the authenticated user dict right after api.auth() (best-effort)."""
+    try:
+        raw = getattr(api, "user", None)
+        if raw is None:
+            return None
+        return _to_dict(raw)
+    except Exception:
+        return None
 
 
 def _extract_items(resp):
@@ -246,6 +272,11 @@ def main():
         pages = int(pagination.get("pages") or 1)
         sort_by = pagination.get("sort_by") or None
         sort_order = pagination.get("sort_order") or "desc"
+        # Runner timeout is 10 min (600 s). Scale the page-loop budget with the
+        # page count so large ranges don't truncate early; cap at 8 min to leave
+        # setup/auth headroom. An explicit budget_sec from the worker overrides.
+        budget_sec = int(pagination.get("budget_sec") or 0)
+        budget_limit = budget_sec if budget_sec > 0 else min(480, max(180, pages * 5))
 
         _d1_execute("UPDATE job_results SET status='running', updated_at=datetime('now') WHERE job_id=?", [job_id])
         print(f"  action={action} pages={pages}")
@@ -255,13 +286,40 @@ def main():
         _pixiv_api_call(api.auth, refresh_token=refresh_token)
         print("  pixiv auth ok")
 
+        # 3b. Backfill the owning gallery user's public profile — the worker can't
+        # reach Pixiv (CF egress 403), so this run is the only place the identity
+        # is confirmed. A bad/expired token raises in api.auth() above and the job
+        # errors with Pixiv's own message, surfaced in the poll UI.
+        gallery_user_id = params.get("gallery_user_id")
+        user_profile = _auth_user_profile(api)
+        if gallery_user_id and user_profile:
+            try:
+                avatar = (user_profile.get("profile_image_urls") or {}).get("px_50x50") or ""
+                _d1_execute(
+                    "UPDATE gallery_users SET pixiv_user_id=?, pixiv_account=?, pixiv_name=?, pixiv_avatar=?, last_used_at=datetime('now') WHERE id=?",
+                    [str(user_profile.get("id") or ""), user_profile.get("account") or "",
+                     user_profile.get("name") or "", avatar, gallery_user_id],
+                )
+                print("  profile backfilled")
+            except Exception as e:
+                print(f"  profile backfill skipped: {e}")
+
+        if action == "whoami":
+            payload = {"results": [], "user": user_profile or {}, "count": 0, "pages": 0}
+            _d1_execute(
+                "UPDATE job_results SET status='done', payload=?, updated_at=datetime('now') WHERE job_id=?",
+                [json.dumps(payload, ensure_ascii=False), job_id],
+            )
+            print("  whoami done")
+            return
+
         all_items = []
         next_offset = None
         page = 0
         warning = None
         start = time.time()
         while page < pages:
-            if time.time() - start > _TOTAL_BUDGET_SEC:
+            if time.time() - start > budget_limit:
                 warning = f"timeout after {page} page(s)"
                 break
             call_params = dict(params)
@@ -274,7 +332,7 @@ def main():
             print(f"  page {page}: +{len(items)} (total {len(all_items)})")
             if not items or next_offset is None:
                 break
-            time.sleep(0.6 + random.uniform(0, 0.5))
+            time.sleep(0.8 + random.uniform(0, 0.7))
 
         results = _sort_results(all_items, sort_by, sort_order)
         payload = {"results": results, "count": len(results), "pages": page}
