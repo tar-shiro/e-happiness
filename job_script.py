@@ -229,150 +229,68 @@ def _run_action(api, action, params):
     raise RuntimeError(f"unsupported action: {action}")
 
 
-# ---- Compound search (multi-keyword / tags / excludes / match) ----
+# ---- Multi-keyword search (each keyword its own pixiv call) ----
 #
-# pixiv's API only takes one `word` string; space-separated words in it already
-# do native AND (for partial_match_for_tags). So we only do our own work when
-# the combination can't be expressed in one call. The logic is split into three
-# independent switches + two exclude fields:
-#   - word_match  ('and'|'or'): how multiple keywords in `word` combine.
-#     AND → one native space-AND call; OR → one call per keyword, union. OR
-#     capped at 5 terms.
-#   - tags_match  ('and'|'or'): same, for the tags field. AND → one native
-#     space-AND call; OR → one call per tag (partial_match_for_tags), capped 5.
-#   - cross_match ('all'|'any'): keyword-group × tag-group. all → intersect by
-#     id; any → union + dedupe.
-#   - exclude      : excluded keywords, post-filter over title/tags/artist.
-#   - exclude_tags : excluded tags, post-filter over the item tag list only.
+# pixiv's search API takes one `word` + one `search_target` per call, so
+# multi-keyword is N independent native calls (each keyword row in the UI sends
+# its own word/search_target). Results are merged by id and each item is tagged
+# with `qmatch` — the sorted list of query indices that matched it — so the
+# frontend can combine AND/OR (and exclude) client-side without re-querying.
 
 def _item_id(item):
     return item.get("id") or item.get("illust_id") or item.get("novel_id")
 
 
-def _matches_exclude(item, exclude_terms):
-    text = " ".join([
-        item.get("title") or "",
-        item.get("name") or "",
-        " ".join((t.get("name") or "") for t in (item.get("tags") or [])),
-        (item.get("user") or {}).get("name") or "",
-    ]).lower()
-    return any(term in text for term in exclude_terms)
-
-
-def _matches_exclude_tags(item, exclude_tags):
-    item_tags = " ".join((t.get("name") or "") for t in (item.get("tags") or [])).lower()
-    return any(t in item_tags for t in exclude_tags)
-
-
-def _build_query_groups(params):
-    """Return [(group, [search_kwargs...]), ...], group in ('word','tags').
-    Each kwargs dict is one pixiv call. Per field: AND → single native
-    space-AND call; OR → one call per term, capped at 5."""
-    word = (params.get("word") or "").strip()
-    tags = (params.get("tags") or "").strip()
-    chosen = params.get("search_target") or "partial_match_for_tags"
-    common = {k: params[k] for k in ("sort", "start_date", "end_date") if params.get(k)}
-    groups = []
-    if word:
-        wm = (params.get("word_match") or "and")
-        if wm == "or":
-            qs = [dict(common, word=t, search_target=chosen) for t in word.split()[:5]]
-        else:
-            qs = [dict(common, word=word, search_target=chosen)]
-        groups.append(("word", qs))
-    if tags:
-        tm = (params.get("tags_match") or "and")
-        if tm == "or":
-            qs = [dict(common, word=t, search_target="partial_match_for_tags") for t in tags.split()[:5]]
-        else:
-            qs = [dict(common, word=tags, search_target="partial_match_for_tags")]
-        groups.append(("tags", qs))
-    return groups
-
-
-def _combine_group(per_query, mode):
-    """Combine a group's per-query item lists. AND → intersect by id across all
-    its queries; OR → union + dedupe."""
-    if not per_query:
-        return []
-    if mode == "or" or len(per_query) == 1:
-        merged = []
-        seen = set()
-        for lst in per_query:
-            for i in lst:
-                key = _item_id(i)
-                if key in seen:
-                    continue
-                seen.add(key)
-                merged.append(i)
-        return merged
-    keep = {_item_id(i) for i in per_query[0]}
-    for lst in per_query[1:]:
-        keep &= {_item_id(i) for i in lst}
-    return [i for i in per_query[0] if _item_id(i) in keep]
-
-
-def _run_compound_search(api, action, params, pages, budget_limit):
-    """Run each field's query set, combine per-field (word_match / tags_match),
-    cross-combine (cross_match), then apply both exclude filters. Returns the
-    combined item list."""
+def _run_keyword_queries(api, action, queries, pages, budget_limit):
+    """Run each {word, search_target} query as one native pixiv call, merge
+    results by id, and tag every item with its `qmatch` list. `queries` is a
+    list of dicts from the frontend (word + optional search_target). Returns
+    the merged, deduped item list."""
     method = getattr(api, action)
-    exclude_terms = (params.get("exclude") or "").lower().split()
-    exclude_tags = (params.get("exclude_tags") or "").lower().split()
-    cross_match = params.get("cross_match") or "all"
-    groups = _build_query_groups(params)
-    group_results = {}
+    merged = {}   # id -> item
+    qmatch = {}   # id -> set of query indices
     start = time.time()
-    for group, queries in groups:
-        per_query = []
-        for q in queries:
-            lst = []
-            next_offset = None
-            page = 0
-            while page < pages:
-                if time.time() - start > budget_limit:
-                    break
-                call_params = dict(q)
-                if next_offset is not None:
-                    call_params["offset"] = next_offset
-                resp = _pixiv_api_call(method, **call_params)
-                items, next_offset = _extract_items(resp)
-                lst.extend(items)
-                page += 1
-                if not items or next_offset is None:
-                    break
-                time.sleep(0.8 + random.uniform(0, 0.7))
-            per_query.append(lst)
+    for qi, q in enumerate(queries):
+        word = (q.get("word") or "").strip()
+        if not word:
+            continue
+        target = q.get("search_target") or "partial_match_for_tags"
+        next_offset = None
+        page = 0
+        while page < pages:
             if time.time() - start > budget_limit:
                 break
-        group_results[group] = _combine_group(per_query, params.get(group + "_match") or "and")
+            call_params = {"word": word, "search_target": target}
+            if next_offset is not None:
+                call_params["offset"] = next_offset
+            if q.get("sort"):
+                call_params["sort"] = q["sort"]
+            if q.get("start_date"):
+                call_params["start_date"] = q["start_date"]
+            if q.get("end_date"):
+                call_params["end_date"] = q["end_date"]
+            if action == "search_illust" and q.get("type"):
+                call_params["type"] = q["type"]
+            resp = _pixiv_api_call(method, **call_params)
+            items, next_offset = _extract_items(resp)
+            for item in items:
+                key = _item_id(item)
+                if key is None:
+                    continue
+                if key not in merged:
+                    merged[key] = item
+                    qmatch[key] = set()
+                qmatch[key].add(qi)
+            page += 1
+            print(f"  kw[{qi}] '{word}' page {page}: +{len(items)} (merged {len(merged)})")
+            if not items or next_offset is None:
+                break
+            time.sleep(0.8 + random.uniform(0, 0.7))
         if time.time() - start > budget_limit:
             break
-
-    if "word" in group_results and "tags" in group_results:
-        if cross_match == "all":
-            keep = {_item_id(i) for i in group_results["tags"]}
-            merged = [i for i in group_results["word"] if _item_id(i) in keep]
-        else:
-            merged = []
-            seen = set()
-            for g in ("word", "tags"):
-                for i in group_results[g]:
-                    key = _item_id(i)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    merged.append(i)
-    elif "word" in group_results:
-        merged = group_results["word"]
-    else:
-        merged = group_results.get("tags", [])
-
-    if exclude_terms:
-        merged = [i for i in merged if not _matches_exclude(i, exclude_terms)]
-    if exclude_tags:
-        merged = [i for i in merged if not _matches_exclude_tags(i, exclude_tags)]
-    return merged
+    for key, item in merged.items():
+        item["qmatch"] = sorted(qmatch[key])
+    return list(merged.values())
 
 
 def _normalize_user_items(items):
@@ -510,29 +428,18 @@ def main():
             print("  whoami done")
             return
 
-        # Compound search (multi-keyword / tags / excludes / match) needs several
-        # pixiv calls combined server-side — the single-query loop can't express
-        # it. Plain single-field searches keep the offset-pagination loop.
-        is_compound = (
-            action in ("search_illust", "search_novel")
-            and bool(
-                (params.get("tags") or "").strip()
-                or (params.get("exclude") or "").strip()
-                or (params.get("exclude_tags") or "").strip()
-                or (params.get("word_match") or "and") != "and"
-                or (params.get("tags_match") or "and") != "and"
-                or (params.get("cross_match") or "all") != "all"
-            )
-        )
+        # Multi-keyword search: each {word, search_target} in `queries` runs as its
+        # own native pixiv call (the native API accepts ONE word + ONE search_target),
+        # items are merged and tagged with `qmatch` so the frontend judges AND/OR.
+        # Plain single-field searches keep the offset-pagination loop.
+        queries = params.get("queries")
 
         warning = None
-        if is_compound:
-            all_items = _run_compound_search(api, action, params, pages, budget_limit)
+        if action in ("search_illust", "search_novel") and isinstance(queries, list) and len(queries) > 0:
+            all_items = _run_keyword_queries(api, action, queries, pages, budget_limit)
             page = pages
             print(
-                f"  compound: {len(all_items)} combined results "
-                f"(word={params.get('word_match') or 'and'}, tags={params.get('tags_match') or 'and'}, "
-                f"cross={params.get('cross_match') or 'all'})"
+                f"  keyword search: {len(all_items)} merged results over {len(queries)} query rows"
             )
         else:
             all_items = []
