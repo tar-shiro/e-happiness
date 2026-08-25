@@ -28,6 +28,8 @@ Security notes:
     and is deleted from D1 the moment it is read. It is never printed.
   - Nothing in this script ever touches a file with a token in it.
   - CF_ACCOUNT_ID / CF_D1_DB_ID / CF_API_TOKEN come from workflow secrets.
+
+  IMPORTANT:THIS IS DEPLOYED SEPERATELY IN AN GITHUB REPO FROM THE MAIN SITE
 """
 
 import json
@@ -92,6 +94,26 @@ def _d1_select_rows(sql, params=None):
     """Run a SELECT and return the result rows (empty list if none)."""
     data = _d1_execute(sql, params)
     return (data.get("result") or [{}])[0].get("results") or []
+
+
+def _set_progress(job_id, **kw):
+    """Write a JSON progress snapshot to job_results.progress (best-effort).
+
+    The column is added by a one-off D1 migration
+    (`ALTER TABLE job_results ADD COLUMN progress TEXT`); until that migration
+    runs on the live DB this silently no-ops so old deployments keep working.
+
+    Frequency note: called at most once per fetched page, nowhere near D1's
+    write limits. The frontend polls every 3s, so sub-page granularity would
+    be invisible anyway.
+    """
+    try:
+        _d1_execute(
+            "UPDATE job_results SET progress=?, updated_at=datetime('now') WHERE job_id=?",
+            [json.dumps(kw, ensure_ascii=False), job_id],
+        )
+    except Exception:
+        pass
 
 
 # ---- pixivpy3 helpers ----
@@ -241,11 +263,12 @@ def _item_id(item):
     return item.get("id") or item.get("illust_id") or item.get("novel_id")
 
 
-def _run_keyword_queries(api, action, queries, pages, budget_limit):
+def _run_keyword_queries(api, action, queries, pages, budget_limit, progress_cb=None):
     """Run each {word, search_target} query as one native pixiv call, merge
     results by id, and tag every item with its `qmatch` list. `queries` is a
     list of dicts from the frontend (word + optional search_target). Returns
-    the merged, deduped item list."""
+    the merged, deduped item list. progress_cb(**fields) is invoked once per
+    fetched page so the UI can show real progress while it waits."""
     method = getattr(api, action)
     merged = {}   # id -> item
     qmatch = {}   # id -> set of query indices
@@ -283,6 +306,9 @@ def _run_keyword_queries(api, action, queries, pages, budget_limit):
                 qmatch[key].add(qi)
             page += 1
             print(f"  kw[{qi}] '{word}' page {page}: +{len(items)} (merged {len(merged)})")
+            if progress_cb:
+                progress_cb(phase="fetching", kw=qi + 1, kws=len(queries),
+                            kw_page=page, pages=pages, merged=len(merged))
             if not items or next_offset is None:
                 break
             time.sleep(0.8 + random.uniform(0, 0.7))
@@ -400,6 +426,7 @@ def main():
         api = AppPixivAPI()
         auth_resp = _pixiv_api_call(api.auth, refresh_token=refresh_token)
         print("  pixiv auth ok")
+        _set_progress(job_id, phase="auth")
 
         # 3b. Backfill the owning gallery user's public profile — the worker can't
         # reach Pixiv (CF egress 403), so this run is the only place the identity
@@ -436,7 +463,8 @@ def main():
 
         warning = None
         if action in ("search_illust", "search_novel") and isinstance(queries, list) and len(queries) > 0:
-            all_items = _run_keyword_queries(api, action, queries, pages, budget_limit)
+            all_items = _run_keyword_queries(api, action, queries, pages, budget_limit,
+                                             progress_cb=lambda **f: _set_progress(job_id, **f))
             page = pages
             print(
                 f"  keyword search: {len(all_items)} merged results over {len(queries)} query rows"
@@ -458,9 +486,13 @@ def main():
                 all_items.extend(items)
                 page += 1
                 print(f"  page {page}: +{len(items)} (total {len(all_items)})")
+                _set_progress(job_id, phase="fetching", page=page, pages=pages,
+                              total=len(all_items))
                 if not items or next_offset is None:
                     break
                 time.sleep(0.8 + random.uniform(0, 0.7))
+
+        _set_progress(job_id, phase="finalizing", total=len(all_items))
 
         if action == "search_user":
             all_items = _normalize_user_items(all_items)
